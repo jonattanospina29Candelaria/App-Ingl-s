@@ -16,7 +16,7 @@ const SCENARIOS = {
   smalltalk: { es: 'Small talk', en: 'Casual small talk: weather, weekend plans, sports, family, food.' },
 };
 
-const DEFAULTS = { apiKey: '', model: 'gemini-flash-latest', proxyUrl: '', proxyToken: '', level: 'B1', rate: '0.9', scenario: 'free', voice: '' };
+const DEFAULTS = { apiKey: '', model: 'gemini-flash-lite-latest', proxyUrl: '', proxyToken: '', level: 'B1', rate: '0.9', scenario: 'free', voice: '' };
 let settings = { ...DEFAULTS, ...store.get('settings', {}) };
 let history = [];          // contenido para Gemini
 let words = store.get('words', []);   // [{word, meaning_es}]
@@ -98,17 +98,21 @@ const SCHEMA = {
 
 function modelId() { return (settings.model || DEFAULTS.model).trim().replace(/^models\//, ''); }
 
-async function callGemini(payload) {
+// Modelos de respaldo si el elegido está saturado (503) o sin cupo (429)
+const FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-flash-latest', 'gemini-2.5-flash-lite', 'gemini-2.5-flash'];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function requestGemini(payload, model) {
   let data;
   if (settings.proxyUrl) {
     const r = await fetch(settings.proxyUrl, {
       method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ action: 'generate', token: settings.proxyToken, model: modelId(), payload }),
+      body: JSON.stringify({ action: 'generate', token: settings.proxyToken, model, payload }),
     });
     data = await r.json();
   } else {
     if (!settings.apiKey) throw Object.assign(new Error('Falta la clave de API. Ábrela en Ajustes.'), { code: 'nokey' });
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId())}:generateContent`, {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey },
       body: JSON.stringify(payload),
     });
@@ -118,12 +122,35 @@ async function callGemini(payload) {
     const c = data.error.code;
     let msg = data.error.message || 'Error desconocido';
     if (c === 429) msg = 'Alcanzaste el límite gratuito por minuto o por día. Espera un momento e intenta de nuevo.';
+    else if (c === 503 || c === 500) msg = 'Los modelos de Gemini están saturados en este momento. Espera un minuto e intenta de nuevo, o elige otro modelo en Ajustes.';
     else if (c === 400 && /API key/i.test(msg)) msg = 'La clave de API no es válida. Revísala en Ajustes.';
     else if (c === 403) msg = 'Acceso denegado: revisa la clave de API o el token del intermediario.';
-    else if (c === 404) msg = `El modelo "${modelId()}" no existe. En Ajustes toca "Ver modelos" y elige otro.`;
+    else if (c === 404) msg = `El modelo "${model}" no existe. En Ajustes toca "Ver modelos" y elige otro.`;
     else if (c === 401) msg = 'Token del intermediario incorrecto.';
-    throw new Error(msg);
+    throw Object.assign(new Error(msg), { status: c });
   }
+  return data;
+}
+
+async function callGemini(payload) {
+  const models = [modelId(), ...FALLBACK_MODELS.filter((m) => m !== modelId())];
+  let data, lastErr;
+  outer: for (const [i, model] of models.entries()) {
+    for (let attempt = 0; attempt < (i === 0 ? 2 : 1); attempt++) {
+      try {
+        data = await requestGemini(payload, model);
+        if (i > 0) addSys(`El modelo elegido estaba saturado; respondió ${model}.`);
+        break outer;
+      } catch (e) {
+        lastErr = e;
+        const retryable = e.status === 503 || e.status === 500 || e.status === 429 || (i > 0 && e.status === 404);
+        if (!retryable) throw e;
+        setStatus('Gemini está ocupado, reintentando…');
+        await sleep(attempt === 0 && i === 0 ? 1500 : 500);
+      }
+    }
+  }
+  if (!data) throw lastErr;
   const parts = data.candidates?.[0]?.content?.parts || [];
   const raw = parts.filter((p) => !p.thought).map((p) => p.text || '').join('').trim();
   if (!raw) throw new Error('Gemini no devolvió respuesta. Intenta otra vez.');
@@ -210,44 +237,80 @@ function stopSpeaking() { if (synth?.speaking) synth.cancel(); avatar.setSpeakin
 
 // ---------- Micrófono (reconocimiento de voz) ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, listening = false, finalText = '';
+let rec = null, listening = false, wantListening = false, finalText = '', silenceTimer = null;
+const SILENCE_SEND_MS = 4000;   // se envía tras 4 s de silencio (si ya dijiste algo)
+const SILENCE_EMPTY_MS = 12000; // se apaga tras 12 s si no dijiste nada
 if (!SR) {
   micBtn.disabled = true;
   micBtn.title = 'Este navegador no soporta reconocimiento de voz. Usa Chrome en Android.';
 }
+function armSilence() {
+  clearTimeout(silenceTimer);
+  const hasText = !!text.value.trim();
+  silenceTimer = setTimeout(() => { if (wantListening) stopListening(); }, hasText ? SILENCE_SEND_MS : SILENCE_EMPTY_MS);
+}
 function startListening() {
   if (!SR || busy) return;
   stopSpeaking();
+  finalText = ''; text.value = '';
+  wantListening = true; listening = true;
+  micBtn.classList.add('on'); avatar.setMode('listening');
+  setStatus('Escuchando… toca el micrófono para enviar', true);
+  armSilence();
+  startRec();
+}
+// El reconocimiento de Android se detiene en cada pausa; lo reiniciamos
+// y acumulamos el texto hasta que tú toques el micrófono o haya silencio largo.
+function startRec() {
+  let sessionFinal = '';
   rec = new SR();
   rec.lang = 'en-US';
   rec.interimResults = true;
   rec.continuous = false;
   rec.maxAlternatives = 1;
-  finalText = '';
-  rec.onstart = () => { listening = true; micBtn.classList.add('on'); avatar.setMode('listening'); setStatus('Escuchando… habla en inglés', true); };
   rec.onresult = (e) => {
-    let interim = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
+    let interim = ''; sessionFinal = '';
+    for (let i = 0; i < e.results.length; i++) {
       const r = e.results[i];
-      if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript;
+      if (r.isFinal) sessionFinal += r[0].transcript + ' '; else interim += r[0].transcript;
     }
-    text.value = (finalText + ' ' + interim).trim();
+    text.value = (finalText + ' ' + sessionFinal + ' ' + interim).replace(/\s+/g, ' ').trim();
+    autosize();
+    armSilence();
   };
   rec.onerror = (e) => {
-    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') addSys('Permite el uso del micrófono para esta app en los ajustes del navegador.', true);
-    else if (e.error === 'no-speech') setStatus('No te escuché. Toca el micrófono e intenta de nuevo.');
-    else if (e.error !== 'aborted') addSys('Error del micrófono: ' + e.error, true);
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      wantListening = false;
+      addSys('Permite el uso del micrófono para esta app en los ajustes del navegador.', true);
+    } else if (e.error === 'network') {
+      wantListening = false;
+      addSys('El reconocimiento de voz necesita internet. Revisa tu conexión.', true);
+    }
   };
   rec.onend = () => {
-    listening = false; micBtn.classList.remove('on');
-    if (avatar.mode === 'listening') avatar.setMode('idle');
-    const said = (finalText || text.value).trim();
-    if (said) { text.value = ''; send(said); }
-    else if (!busy) setStatus('Toca el micrófono para hablar');
+    finalText = (finalText + ' ' + sessionFinal).replace(/\s+/g, ' ').trim();
+    if (wantListening) { try { startRec(); return; } catch {} }
+    finishListening();
   };
-  try { rec.start(); } catch {}
+  try { rec.start(); } catch { if (!wantListening) finishListening(); }
 }
-micBtn.onclick = () => (listening ? rec?.stop() : startListening());
+function stopListening() {
+  wantListening = false;
+  clearTimeout(silenceTimer);
+  try { rec?.stop(); } catch { finishListening(); }
+}
+function finishListening() {
+  if (!listening) return;
+  listening = false; wantListening = false;
+  clearTimeout(silenceTimer);
+  micBtn.classList.remove('on');
+  if (avatar.mode === 'listening') avatar.setMode('idle');
+  const said = text.value.trim();
+  text.value = ''; autosize();
+  if (said) send(said);
+  else if (!busy) setStatus('No te escuché. Toca el micrófono e intenta de nuevo.');
+}
+micBtn.onclick = () => (listening ? stopListening() : startListening());
 
 // ---------- Texto ----------
 sendBtn.onclick = () => { const t = text.value; text.value = ''; autosize(); send(t); };
@@ -279,6 +342,14 @@ $('settingsForm').addEventListener('submit', () => {
   if ((settings.apiKey || settings.proxyUrl) && (changed || history.length === 0)) newSession();
 });
 $('testVoice').onclick = () => { readForm(); speak("Hi! I'm Alex, your English tutor. Let's practice together."); };
+function fillModelPick(list) {
+  const pick = $('modelPick');
+  pick.innerHTML = '';
+  pick.append(new Option(`Elige uno de los ${list.length} modelos…`, ''));
+  list.sort((a, b) => (/lite/.test(b) - /lite/.test(a)) || a.localeCompare(b)).forEach((n) => pick.append(new Option(n, n)));
+  pick.hidden = false;
+}
+$('modelPick').onchange = (e) => { if (e.target.value) $('model').value = e.target.value; };
 $('loadModels').onclick = async () => {
   readForm();
   const btn = $('loadModels'); btn.textContent = 'Cargando…';
@@ -293,13 +364,11 @@ $('loadModels').onclick = async () => {
     const list = (data.models || [])
       .filter((m) => m.supportedGenerationMethods?.includes('generateContent') && /gemini/i.test(m.name) && !/embedding|tts|image|live|audio/i.test(m.name))
       .map((m) => m.name.replace(/^models\//, ''));
-    const dl = $('modelList'); dl.innerHTML = '';
-    list.forEach((n) => dl.append(new Option(n, n)));
-    btn.textContent = `${list.length} modelos`;
-    $('model').focus();
+    fillModelPick(list);
+    btn.textContent = 'Ver modelos';
   } catch (e) {
     btn.textContent = 'Ver modelos';
-    alert('No se pudo cargar la lista: ' + e.message);
+    addSys('No se pudo cargar la lista de modelos: ' + e.message, true);
   }
 };
 

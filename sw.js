@@ -1,5 +1,5 @@
 // Service worker: guarda la app para que abra rápido y funcione como app instalada.
-const CACHE = 'tutor-ingles-v1';
+const CACHE = 'tutor-ingles-v3';
 const SHELL = [
   './', './index.html', './app.js', './avatar.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png',

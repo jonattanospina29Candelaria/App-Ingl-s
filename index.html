@@ -158,10 +158,10 @@
     </div>
     <label for="model">Modelo</label>
     <div class="row">
-      <input id="model" list="modelList" placeholder="gemini-flash-latest">
+      <input id="model" placeholder="gemini-flash-lite-latest">
       <button type="button" class="btn" id="loadModels" style="flex:none">Ver modelos</button>
     </div>
-    <datalist id="modelList"></datalist>
+    <select id="modelPick" hidden style="margin-top:8px"></select>
 
     <details>
       <summary>Opcional: usar intermediario (Apps Script)</summary>
